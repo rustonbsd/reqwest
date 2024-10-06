@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::into_url::{IntoUrl, IntoUrlSealed};
+use crate::wireguard::{IntoWgConf, WireGuardConfig};
 use crate::Url;
 use http::{header::HeaderValue, Uri};
 use ipnet::IpNet;
@@ -113,14 +114,20 @@ pub enum ProxyScheme {
         auth: Option<(String, String)>,
         remote_dns: bool,
     },
+    #[cfg(feature = "wireguard")]
+    Wireguard {
+        wg_conf: WireGuardConfig,
+        remote_dns: bool,
+    },
 }
 
 impl ProxyScheme {
     fn maybe_http_auth(&self) -> Option<&HeaderValue> {
         match self {
             ProxyScheme::Http { auth, .. } | ProxyScheme::Https { auth, .. } => auth.as_ref(),
-            #[cfg(feature = "socks")]
+            #[cfg(feature = "socks")]         
             _ => None,
+            ProxyScheme::Wireguard { .. } => None,
         }
     }
 }
@@ -134,6 +141,12 @@ pub trait IntoProxyScheme {
 
 impl<S: IntoUrl> IntoProxyScheme for S {
     fn into_proxy_scheme(self) -> crate::Result<ProxyScheme> {
+        // check for wireguard
+        match WireGuardConfig::from_str(self.as_str()) {
+            Ok(wg_conf) => return Ok(ProxyScheme::Wireguard { wg_conf: wg_conf, remote_dns: false }),
+            Err(_) =>{ },
+        };
+
         // validate the URL
         let url = match self.as_str().into_url() {
             Ok(ok) => ok,
@@ -647,6 +660,8 @@ impl ProxyScheme {
             ProxyScheme::Socks5 { ref mut auth, .. } => {
                 *auth = Some((username.into(), password.into()));
             }
+            #[cfg(feature = "wireguard")]
+            ProxyScheme::Wireguard { .. } => {},
         }
     }
 
@@ -666,6 +681,10 @@ impl ProxyScheme {
             ProxyScheme::Socks5 { .. } => {
                 panic!("Socks5 is not supported for this method")
             }
+            #[cfg(feature = "wireguard")]
+            ProxyScheme::Wireguard { .. } => {
+                panic!("Wireguard is not supported for this method")
+            },
         }
     }
 
@@ -685,6 +704,8 @@ impl ProxyScheme {
             ProxyScheme::Socks4 { .. } => {}
             #[cfg(feature = "socks")]
             ProxyScheme::Socks5 { .. } => {}
+            #[cfg(feature = "wireguard")]
+            ProxyScheme::Wireguard { .. } => {},
         }
 
         self
@@ -742,6 +763,8 @@ impl ProxyScheme {
             ProxyScheme::Socks4 { .. } => "socks4",
             #[cfg(feature = "socks")]
             ProxyScheme::Socks5 { .. } => "socks5",
+            #[cfg(feature = "wireguard")]
+            ProxyScheme::Wireguard { .. } => "wireguard",
         }
     }
 
@@ -754,6 +777,8 @@ impl ProxyScheme {
             ProxyScheme::Socks4 { .. } => panic!("socks4"),
             #[cfg(feature = "socks")]
             ProxyScheme::Socks5 { .. } => panic!("socks5"),
+            #[cfg(feature = "wireguard")]
+            ProxyScheme::Wireguard { .. } => panic!("wireguard"),
         }
     }
 }
@@ -776,6 +801,10 @@ impl fmt::Debug for ProxyScheme {
                 let h = if *remote_dns { "h" } else { "" };
                 write!(f, "socks5{h}://{addr}")
             }
+            #[cfg(feature = "wireguard")]
+            ProxyScheme::Wireguard { wg_conf, .. } => {
+                write!(f,"{wg_conf:?}")
+            },
         }
     }
 }
@@ -1156,6 +1185,8 @@ mod tests {
             ProxyScheme::Https { host, .. } => ("https", host),
             #[cfg(feature = "socks")]
             _ => panic!("intercepted as socks"),
+            #[cfg(feature = "wireguard")]
+            ProxyScheme::Wireguard { .. } => panic!("intercepted as wireguard"),
         };
         http::Uri::builder()
             .scheme(scheme)

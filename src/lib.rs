@@ -365,6 +365,8 @@ if_hyper! {
     #[cfg(feature = "__tls")]
     pub mod tls;
     mod util;
+    #[cfg(feature = "wireguard")]
+    mod wireguard;
 }
 
 if_wasm! {

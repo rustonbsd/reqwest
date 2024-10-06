@@ -29,6 +29,51 @@ use crate::proxy::{Proxy, ProxyScheme};
 
 pub(crate) type HttpConnector = hyper_util::client::legacy::connect::HttpConnector<DynResolver>;
 
+pub struct WireguardStream(pub tokio_wireguard::TcpStream);
+
+impl Connection for WireguardStream {
+    fn connected(&self) -> hyper_util::client::legacy::connect::Connected {
+        hyper_util::client::legacy::connect::Connected::new()
+    }
+}
+
+impl Unpin for WireguardStream {}
+
+impl tokio::io::AsyncRead for WireguardStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // Since we implement Unpin, we can safely call get_mut()
+        Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for WireguardStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Connector {
     inner: Inner,
@@ -272,6 +317,63 @@ impl Connector {
         })
     }
 
+    #[cfg(feature = "wireguard")]
+    async fn connect_wireguard(&self, dst: Uri, proxy: ProxyScheme) -> Result<Conn, BoxError> {
+        
+        match &self.inner {
+            #[cfg(feature = "default-tls")]
+            Inner::DefaultTls(_http, tls) => {
+                if dst.scheme() == Some(&Scheme::HTTPS) {
+                    let host = dst.host().ok_or("no host in url")?.to_string();
+                    let conn = wireguard::connect(proxy, dst, wireguard::DnsResolve::Local).await?;
+                    let conn = TokioIo::new(conn);
+                    let conn = TokioIo::new(conn);
+                    let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
+                    let io = tls_connector.connect(&host, conn).await?;
+                    let io = TokioIo::new(io);
+                    return Ok(Conn {
+                        inner: self.verbose.wrap(NativeTlsConn { inner: io }),
+                        is_proxy: false,
+                        tls_info: self.tls_info,
+                    });
+                }
+            }
+            #[cfg(feature = "__rustls")]
+            Inner::RustlsTls { tls, .. } => {
+                if dst.scheme() == Some(&Scheme::HTTPS) {
+                    use std::convert::TryFrom;
+                    use tokio_rustls::TlsConnector as RustlsConnector;
+
+                    let tls = tls.clone();
+                    let host = dst.host().ok_or("no host in url")?.to_string();
+                    let conn = socks::connect(proxy, dst, dns).await?;
+                    let conn = TokioIo::new(conn);
+                    let conn = TokioIo::new(conn);
+                    let server_name =
+                        rustls_pki_types::ServerName::try_from(host.as_str().to_owned())
+                            .map_err(|_| "Invalid Server Name")?;
+                    let io = RustlsConnector::from(tls)
+                        .connect(server_name, conn)
+                        .await?;
+                    let io = TokioIo::new(io);
+                    return Ok(Conn {
+                        inner: self.verbose.wrap(RustlsTlsConn { inner: io }),
+                        is_proxy: false,
+                        tls_info: false,
+                    });
+                }
+            }
+            #[cfg(not(feature = "__tls"))]
+            Inner::Http(_) => (),
+        }
+
+        wireguard::connect(proxy, dst, wireguard::DnsResolve::Local).await.map(|tcp: WireguardStream| Conn {
+            inner: self.verbose.wrap(TokioIo::new(tcp)),
+            is_proxy: false,
+            tls_info: false,
+        })
+    }
+    
     async fn connect_with_maybe_proxy(self, dst: Uri, is_proxy: bool) -> Result<Conn, BoxError> {
         match self.inner {
             #[cfg(not(feature = "__tls"))]
@@ -371,6 +473,8 @@ impl Connector {
             ProxyScheme::Socks4 { .. } => return self.connect_socks(dst, proxy_scheme).await,
             #[cfg(feature = "socks")]
             ProxyScheme::Socks5 { .. } => return self.connect_socks(dst, proxy_scheme).await,
+            #[cfg(feature = "wireguard")]
+            ProxyScheme::Wireguard { .. } => return self.connect_wireguard(dst,proxy_scheme).await,
         };
 
         #[cfg(feature = "__tls")]
@@ -528,6 +632,13 @@ impl TlsInfoFactory for tokio::net::TcpStream {
 }
 
 #[cfg(feature = "__tls")]
+impl TlsInfoFactory for WireguardStream {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        None
+    }
+}
+
+#[cfg(feature = "__tls")]
 impl<T: TlsInfoFactory> TlsInfoFactory for TokioIo<T> {
     fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         self.inner().tls_info()
@@ -536,6 +647,19 @@ impl<T: TlsInfoFactory> TlsInfoFactory for TokioIo<T> {
 
 #[cfg(feature = "default-tls")]
 impl TlsInfoFactory for tokio_native_tls::TlsStream<TokioIo<TokioIo<tokio::net::TcpStream>>> {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        let peer_certificate = self
+            .get_ref()
+            .peer_certificate()
+            .ok()
+            .flatten()
+            .and_then(|c| c.to_der().ok());
+        Some(crate::tls::TlsInfo { peer_certificate })
+    }
+}
+
+#[cfg(feature = "default-tls")]
+impl TlsInfoFactory for tokio_native_tls::TlsStream<TokioIo<TokioIo<WireguardStream>>> {
     fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         let peer_certificate = self
             .get_ref()
@@ -565,7 +689,34 @@ impl TlsInfoFactory
 }
 
 #[cfg(feature = "default-tls")]
+impl TlsInfoFactory
+    for tokio_native_tls::TlsStream<
+        TokioIo<hyper_tls::MaybeHttpsStream<TokioIo<WireguardStream>>>,
+    >
+{
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        let peer_certificate = self
+            .get_ref()
+            .peer_certificate()
+            .ok()
+            .flatten()
+            .and_then(|c| c.to_der().ok());
+        Some(crate::tls::TlsInfo { peer_certificate })
+    }
+}
+
+#[cfg(feature = "default-tls")]
 impl TlsInfoFactory for hyper_tls::MaybeHttpsStream<TokioIo<tokio::net::TcpStream>> {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        match self {
+            hyper_tls::MaybeHttpsStream::Https(tls) => tls.tls_info(),
+            hyper_tls::MaybeHttpsStream::Http(_) => None,
+        }
+    }
+}
+
+#[cfg(feature = "default-tls")]
+impl TlsInfoFactory for hyper_tls::MaybeHttpsStream<TokioIo<WireguardStream>> {
     fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         match self {
             hyper_tls::MaybeHttpsStream::Https(tls) => tls.tls_info(),
@@ -791,7 +942,7 @@ fn tunnel_eof() -> BoxError {
 
 #[cfg(feature = "default-tls")]
 mod native_tls_conn {
-    use super::TlsInfoFactory;
+    use super::{TlsInfoFactory, WireguardStream};
     use hyper::rt::{Read, ReadBufCursor, Write};
     use hyper_tls::MaybeHttpsStream;
     use hyper_util::client::legacy::connect::{Connected, Connection};
@@ -832,7 +983,47 @@ mod native_tls_conn {
         }
     }
 
+    impl Connection for NativeTlsConn<TokioIo<TokioIo<WireguardStream>>> {
+        fn connected(&self) -> Connected {
+            let connected = self
+                .inner
+                .inner()
+                .get_ref()
+                .get_ref()
+                .get_ref()
+                .inner()
+                .connected();
+            #[cfg(feature = "native-tls-alpn")]
+            match self.inner.inner().get_ref().negotiated_alpn().ok() {
+                Some(Some(alpn_protocol)) if alpn_protocol == b"h2" => connected.negotiated_h2(),
+                _ => connected,
+            }
+            #[cfg(not(feature = "native-tls-alpn"))]
+            connected
+        }
+    }
+
     impl Connection for NativeTlsConn<TokioIo<MaybeHttpsStream<TokioIo<TcpStream>>>> {
+        fn connected(&self) -> Connected {
+            let connected = self
+                .inner
+                .inner()
+                .get_ref()
+                .get_ref()
+                .get_ref()
+                .inner()
+                .connected();
+            #[cfg(feature = "native-tls-alpn")]
+            match self.inner.inner().get_ref().negotiated_alpn().ok() {
+                Some(Some(alpn_protocol)) if alpn_protocol == b"h2" => connected.negotiated_h2(),
+                _ => connected,
+            }
+            #[cfg(not(feature = "native-tls-alpn"))]
+            connected
+        }
+    }
+
+    impl Connection for NativeTlsConn<TokioIo<MaybeHttpsStream<TokioIo<WireguardStream>>>> {
         fn connected(&self) -> Connected {
             let connected = self
                 .inner
@@ -1096,6 +1287,127 @@ mod socks {
         }
     }
 }
+
+#[cfg(feature = "wireguard")]
+mod wireguard {
+    use std::str::FromStr as _;
+    use std::{io, net::SocketAddr};
+    use std::net::ToSocketAddrs;
+
+    use http::Uri;
+    use tokio_wireguard::config::{Address, Peer};
+    use tokio_wireguard::interface::ToInterface as _;
+    use tokio_wireguard::x25519::{PublicKey, StaticSecret};
+
+    use super::{BoxError, Scheme, WireguardStream};
+    use crate::proxy::ProxyScheme;
+    use crate::wireguard::WireGuardConfig;
+    use tokio_wireguard::TcpStream;
+
+    pub(super) enum DnsResolve {
+        Local,
+        Proxy,
+    }
+
+    #[derive(Debug,Clone)]
+    pub(crate) struct WireGuardProxyConfig {
+        pub private_key: [u8; 32],
+        pub address: String,
+        pub public_key: [u8; 32],
+        pub endpoint: String,
+    }
+    
+    impl WireGuardProxyConfig {
+        pub fn parse(wg_conf: &WireGuardConfig) -> anyhow::Result<Self> {
+               
+            let wg_peer = match wg_conf.peers.first() {
+                Some(wg_peer) => wg_peer,
+                None => anyhow::bail!("wireguard peer missing"),
+            };
+    
+            Ok(WireGuardProxyConfig {
+                private_key: wg_conf.private_key,
+                address: match wg_conf.address.first() {
+                    Some(address) => address.clone(),
+                    None => anyhow::bail!("wireguard address missing"),
+                },
+                public_key: wg_peer.public_key.clone(),
+                endpoint: wg_peer.endpoint.clone(),
+            })
+        }
+    
+        pub(super) async fn connect_addr(
+            &self,
+            addr: SocketAddr,
+        ) -> anyhow::Result<TcpStream,anyhow::Error> {
+    
+            let config = tokio_wireguard::Config {
+                interface: tokio_wireguard::config::Interface {
+                    private_key: StaticSecret::from(self.private_key),
+                    // Our address on the WireGuard network
+                    address: Address::from_str(&self.address).unwrap(),
+                    // Let the interface pick a random port
+                    listen_port: None,
+                    // Let the interface pick an appropriate MTU
+                    mtu: None,
+                },
+                peers: vec![Peer {
+                    public_key: PublicKey::from(self.public_key),
+                    // This is where the tunneled WireGuard traffic will be sent
+                    endpoint: Some(self.endpoint.clone().parse().unwrap()),
+                    // IP addresses the peer can handle traffic to and from on the WireGuard network
+                    // The /32 suffix indicates that the peer only handles traffic for itself
+                    allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                    // Send a keepalive packet every 15 seconds
+                    persistent_keepalive: Some(15),
+                }],
+            };
+            let interface = config.to_interface().await.unwrap();
+            
+            Ok(TcpStream::connect(addr, &interface)
+            .await
+            .unwrap())
+        }
+    
+    }
+
+    pub(super) async fn connect(
+        proxy: ProxyScheme,
+        dst: Uri,
+        dns: DnsResolve,
+    ) -> Result<WireguardStream, BoxError> {
+        let https = dst.scheme() == Some(&Scheme::HTTPS);
+        let original_host = dst
+            .host()
+            .ok_or(io::Error::new(io::ErrorKind::Other, "no host in url"))?;
+        let mut host = original_host.to_owned();
+        let port = match dst.port() {
+            Some(p) => p.as_u16(),
+            None if https => 443u16,
+            _ => 80u16,
+        };
+
+        if let DnsResolve::Local = dns {
+            let maybe_new_target = (host.as_str(), port).to_socket_addrs()?.next();
+            if let Some(new_target) = maybe_new_target {
+                host = new_target.ip().to_string();
+            }
+        }
+
+        match proxy {
+            ProxyScheme::Wireguard { wg_conf, .. } => {
+                let stream = {
+                    let wg_proxy_conf = WireGuardProxyConfig::parse(&wg_conf).unwrap();
+                    wg_proxy_conf.connect_addr(SocketAddr::new(std::net::IpAddr::from_str(&host).unwrap(), port)).await.unwrap()
+                };
+
+                Ok(WireguardStream(stream))
+            },
+            _ => unreachable!(),
+        }
+    }
+}
+
 
 mod verbose {
     use hyper::rt::{Read, ReadBufCursor, Write};
