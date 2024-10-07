@@ -6,14 +6,15 @@
 #[tokio::main]
 async fn main() -> Result<(), reqwest::Error> {
     let wg_test: String = r#"[Interface]
-PrivateKey = EJHiDdrGDd1pJsr/BXoBN2r0Y7nQn6eYxgbCUfmSWWo=
-Address = 10.67.65.251/24
+# Device: Warm Kiwi
+PrivateKey = wN8rzyW34ZonBJtp8WxZbpSADQvpZYfG29ZnDNNBkEc=
+Address = 10.64.210.67/32,fc00:bbbb:bbbb:bb01::1:d242/128
 DNS = 10.64.0.1
 
 [Peer]
-PublicKey = tzSfoiq9ZbCcE5I0Xz9kCrsWksDn0wgvaz9TiHYTmnU=
-AllowedIPs = 0.0.0.0/0
-Endpoint = 37.19.221.143:51820
+PublicKey = ov323GyDOEHLT0sNRUUPYiE3BkvFDjpmi1a4fzv49hE=
+AllowedIPs = 0.0.0.0/0,::0/0
+Endpoint = 193.32.126.66:51820
 "#.to_string();
 
     // Make sure you are running tor and this is your socks port

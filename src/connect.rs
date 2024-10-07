@@ -261,6 +261,7 @@ impl Connector {
             ProxyScheme::Http { .. } | ProxyScheme::Https { .. } => {
                 unreachable!("connect_socks is only called for socks proxies");
             }
+            ProxyScheme::Wireguard { .. } => unreachable!("connect_socks is only called for socks proxies"),
         };
 
         match &self.inner {
