@@ -8,7 +8,6 @@ use crate::wireguard::{IntoWgConf, WireGuardConfig};
 use crate::Url;
 use http::{header::HeaderValue, Uri};
 use ipnet::IpNet;
-use once_cell::sync::Lazy;
 use percent_encoding::percent_decode;
 use std::collections::HashMap;
 use std::env;
@@ -293,13 +292,9 @@ impl Proxy {
     }
 
     pub(crate) fn system() -> Proxy {
-        let mut proxy = if cfg!(feature = "__internal_proxy_sys_no_cache") {
-            Proxy::new(Intercept::System(Arc::new(get_sys_proxies(
-                get_from_platform(),
-            ))))
-        } else {
-            Proxy::new(Intercept::System(SYS_PROXIES.clone()))
-        };
+        let mut proxy = Proxy::new(Intercept::System(Arc::new(get_sys_proxies(
+            get_from_platform(),
+        ))));
         proxy.no_proxy = NoProxy::from_env();
         proxy
     }
@@ -904,9 +899,6 @@ impl Dst for Uri {
         self.port().map(|p| p.as_u16())
     }
 }
-
-static SYS_PROXIES: Lazy<Arc<SystemProxyMap>> =
-    Lazy::new(|| Arc::new(get_sys_proxies(get_from_platform())));
 
 /// Get system proxies information.
 ///
