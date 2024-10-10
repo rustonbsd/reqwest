@@ -46,7 +46,7 @@ async fn http_upgrade() {
 
     upgraded.write_all(b"foo=bar").await.unwrap();
 
-    let mut buf = vec![];
+    let mut buf = vec![0;1024];
     upgraded.read_to_end(&mut buf).await.unwrap();
     assert_eq!(buf, b"bar=foo");
 }

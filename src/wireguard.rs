@@ -17,6 +17,70 @@ impl IntoWgConfSealed for WireGuardConfig {
 
 }
 
+use std::{
+    borrow::{Borrow, BorrowMut}, net::{Ipv4Addr, SocketAddr}, pin::Pin, str::FromStr as _, sync::{Arc, OnceLock}, task::{Context, Poll}, thread::sleep, time::Duration
+};
+
+use base64::prelude::*;
+use once_cell::sync::Lazy;
+use tokio::sync::OnceCell;
+use tokio_wireguard::{config::{Address, Peer}, interface::ToInterface as _, x25519::{PublicKey, StaticSecret}, Config, TcpStream};
+
+
+#[derive(Debug, Clone)]
+pub(crate) struct WireGuardProxyConfig {
+    pub private_key: [u8; 32],
+    pub address: String,
+    pub public_key: [u8; 32],
+    pub endpoint: String,
+}
+
+impl WireGuardProxyConfig {
+    pub fn parse(wg_conf: &WireGuardConfig) -> anyhow::Result<Self> {
+        let wg_peer = match wg_conf.peers.first() {
+            Some(wg_peer) => wg_peer,
+            None => anyhow::bail!("wireguard peer missing"),
+        };
+
+        Ok(WireGuardProxyConfig {
+            private_key: wg_conf.private_key,
+            address: match wg_conf.address.first() {
+                Some(address) => address.clone(),
+                None => anyhow::bail!("wireguard address missing"),
+            },
+            public_key: wg_peer.public_key.clone(),
+            endpoint: wg_peer.endpoint.clone(),
+        })
+    }
+
+    pub async fn connect_addr(&self, addr: SocketAddr) -> anyhow::Result<TcpStream, anyhow::Error> {
+        let config = tokio_wireguard::Config {
+            interface: tokio_wireguard::config::Interface {
+                private_key: StaticSecret::from(self.private_key),
+                // Our address on the WireGuard network
+                address: Address::from_str(&self.address).unwrap(),
+                // Let the interface pick a random port
+                listen_port: None,
+                // Let the interface pick an appropriate MTU
+                mtu: None,
+            },
+            peers: vec![Peer {
+                public_key: PublicKey::from(self.public_key),
+                // This is where the tunneled WireGuard traffic will be sent
+                endpoint: Some(self.endpoint.clone().parse().unwrap()),
+                // IP addresses the peer can handle traffic to and from on the WireGuard network
+                // The /32 suffix indicates that the peer only handles traffic for itself
+                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                // Send a keepalive packet every 15 seconds
+                persistent_keepalive: Some(15),
+            }],
+        };
+        let interface = get_or_init_wg_interface(config).await;
+
+        Ok(TcpStream::connect(addr, interface).await.unwrap())
+    }
+}
+
 #[derive(Debug,Clone)]
 pub(crate) struct WireGuardPeer {
     pub public_key: [u8; 32],
@@ -33,41 +97,62 @@ pub(crate) struct WireGuardConfig {
     pub peers: Vec<WireGuardPeer>,
 }
 
+pub static WG_INTERFACE: Lazy<OnceCell<tokio_wireguard::interface::Interface>> =
+    Lazy::new(|| OnceCell::new());
+
+pub(crate) async fn get_or_init_wg_interface(
+    config: Config,
+) -> tokio_wireguard::interface::Interface {
+    let interface = WG_INTERFACE
+        .get_or_init(|| async {
+            println!("Wireguard interface created!");
+            config.to_interface()
+                    .await
+                    .expect("Failed to initialize wireguard interface ")            
+        })
+        .await;
+
+    interface.clone()
+}
+
 impl WireGuardConfig {
     pub fn from_str(wireguard_config_str: &str) -> anyhow::Result<Self, anyhow::Error> {
         let conf = match Ini::load_from_str(wireguard_config_str) {
             Ok(conf) => conf,
             Err(_) => anyhow::bail!("failed to load wireguard config from string"),
         };
-          
+
         // Parse Interface section
         let interface = match conf.section(Some("Interface")) {
             Some(interface) => interface,
             None => anyhow::bail!("Missing Interface section"),
         };
-        
-        let private_key = match interface.get("PrivateKey")
-        {
+
+        let private_key = match interface.get("PrivateKey") {
             Some(private_key) => {
                 let mut pk_bytes: [u8; 32] = [0u8; 32];
-                BASE64_STANDARD.decode_slice(private_key,&mut pk_bytes).unwrap();
+                BASE64_STANDARD
+                    .decode_slice(private_key, &mut pk_bytes)
+                    .unwrap();
                 pk_bytes
-            },
+            }
             None => anyhow::bail!("Missing PrivateKey"),
         };
-        
+
         let address = match interface.get("Address") {
-            Some(addrs) => addrs.split(',')  .map(|s| s.trim().to_string()).collect(),
+            Some(addrs) => addrs.split(',').map(|s| s.trim().to_string()).collect(),
             None => anyhow::bail!("Missing Address"),
         };
-            
-        let listen_port = match interface.get("ListenPort")
+
+        let listen_port = match interface
+            .get("ListenPort")
             .map(|p| p.parse::<u16>())
-            .transpose() {
-                Ok(listen_port) => listen_port,
-                Err(_) => None,
-            };
-        
+            .transpose()
+        {
+            Ok(listen_port) => listen_port,
+            Err(_) => None,
+        };
+
         // Parse Peer sections
         let mut peers = Vec::new();
         for (section_name, section) in conf.iter() {
@@ -76,29 +161,33 @@ impl WireGuardConfig {
                     public_key: match section.get("PublicKey") {
                         Some(public_key) => {
                             let mut pk_slice: [u8; 32] = [0u8; 32];
-                            BASE64_STANDARD.decode_slice(public_key, &mut pk_slice).unwrap();
+                            BASE64_STANDARD
+                                .decode_slice(public_key, &mut pk_slice)
+                                .unwrap();
                             pk_slice
-                        },
+                        }
                         None => anyhow::bail!("Missing PublicKey in Peer"),
                     },
                     allowed_ips: match section.get("AllowedIPs") {
-                        Some(allowed_ips) => allowed_ips.split(',')
-                        .map(|s| s.trim().to_string())
-                        .collect::<Vec<String>>(),
+                        Some(allowed_ips) => allowed_ips
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .collect::<Vec<String>>(),
                         None => anyhow::bail!("Missing AllowedIPs in Peer"),
                     },
                     endpoint: match section.get("Endpoint").map(String::from) {
                         Some(endpoint) => endpoint,
                         None => anyhow::bail!("Missing Endpoint in Peer"),
                     },
-                    persistent_keepalive: section.get("PersistentKeepalive")
+                    persistent_keepalive: section
+                        .get("PersistentKeepalive")
                         .map(|v| v.parse::<u16>())
                         .transpose()?,
                 };
                 peers.push(peer);
             }
         }
-        
+
         Ok(WireGuardConfig {
             private_key,
             address,

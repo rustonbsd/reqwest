@@ -1302,74 +1302,12 @@ mod wireguard {
 
     use super::{BoxError, Scheme, WireguardStream};
     use crate::proxy::ProxyScheme;
-    use crate::wireguard::WireGuardConfig;
+    use crate::wireguard::{self, WireGuardConfig, WireGuardProxyConfig};
     use tokio_wireguard::TcpStream;
 
     pub(super) enum DnsResolve {
         Local,
         Proxy,
-    }
-
-    #[derive(Debug,Clone)]
-    pub(crate) struct WireGuardProxyConfig {
-        pub private_key: [u8; 32],
-        pub address: String,
-        pub public_key: [u8; 32],
-        pub endpoint: String,
-    }
-    
-    impl WireGuardProxyConfig {
-        pub fn parse(wg_conf: &WireGuardConfig) -> anyhow::Result<Self> {
-               
-            let wg_peer = match wg_conf.peers.first() {
-                Some(wg_peer) => wg_peer,
-                None => anyhow::bail!("wireguard peer missing"),
-            };
-    
-            Ok(WireGuardProxyConfig {
-                private_key: wg_conf.private_key,
-                address: match wg_conf.address.first() {
-                    Some(address) => address.clone(),
-                    None => anyhow::bail!("wireguard address missing"),
-                },
-                public_key: wg_peer.public_key.clone(),
-                endpoint: wg_peer.endpoint.clone(),
-            })
-        }
-    
-        pub(super) async fn connect_addr(
-            &self,
-            addr: SocketAddr,
-        ) -> anyhow::Result<TcpStream,anyhow::Error> {
-    
-            let config = tokio_wireguard::Config {
-                interface: tokio_wireguard::config::Interface {
-                    private_key: StaticSecret::from(self.private_key),
-                    // Our address on the WireGuard network
-                    address: Address::from_str(&self.address).unwrap(),
-                    // Let the interface pick a random port
-                    listen_port: None,
-                    // Let the interface pick an appropriate MTU
-                    mtu: None,
-                },
-                peers: vec![Peer {
-                    public_key: PublicKey::from(self.public_key),
-                    // This is where the tunneled WireGuard traffic will be sent
-                    endpoint: Some(self.endpoint.clone().parse().unwrap()),
-                    // IP addresses the peer can handle traffic to and from on the WireGuard network
-                    // The /32 suffix indicates that the peer only handles traffic for itself
-                    allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
-                    // Send a keepalive packet every 15 seconds
-                    persistent_keepalive: Some(15),
-                }],
-            };
-            let interface = config.to_interface().await.unwrap();
-            
-            Ok(TcpStream::connect(addr, &interface)
-            .await
-            .unwrap())
-        }
-    
     }
 
     pub(super) async fn connect(
